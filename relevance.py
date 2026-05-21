@@ -2,8 +2,8 @@
 Skill relevance computation.
 
 Supports two methods:
-- ``keyword`` (default): Fast TF-IDF-like keyword overlap. No dependencies.
-  Sub-millisecond per query. Good enough for 90%+ of cases.
+- ``keyword`` (default): TF-IDF-inspired keyword overlap with skill-name
+  boosting. No dependencies. Sub-millisecond per query.
 - ``embedding``: Uses sentence-transformers to compute cosine similarity
   between the user message and skill descriptions. More accurate for
   ambiguous queries. Requires ``pip install sentence-transformers``.
@@ -16,10 +16,12 @@ Scoring:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
+from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -48,42 +50,35 @@ def _tokenize(text: str) -> List[str]:
     return [w for w in words if w not in _STOP_WORDS and len(w) > 1]
 
 
-# ── Keyword method ─────────────────────────────────────────────────────────
+# ── TF-IDF style keyword scoring ───────────────────────────────────────────
 
-def _keyword_score(query_tokens: List[str], skill_tokens: List[str]) -> float:
-    """Simple overlap-based relevance score.
+def _build_idf(skills: List[Dict[str, Any]]) -> Dict[str, float]:
+    """Compute inverse document frequency for tokens across all skills.
 
-    Returns a score 0.0–1.0 based on:
-    - Direct token overlap (weight: 0.6)
-    - Partial token overlap — query tokens that are substrings of skill tokens
-      or vice versa (weight: 0.3)
-    - Token count normalization (weight: 0.1) — penalizes skills with very
-      few tokens to prevent generic matches
+    Tokens that appear in many skill descriptions get low IDF weights.
+    Tokens that appear in few get high weights — these are the
+    discriminative terms.
     """
-    if not query_tokens or not skill_tokens:
-        return 0.0
+    N = len(skills)
+    if N == 0:
+        return {}
 
-    query_set = set(query_tokens)
-    skill_set = set(skill_tokens)
+    # Count how many skills each token appears in
+    doc_freq: Counter = Counter()
+    for skill in skills:
+        name = skill.get("name", "")
+        desc = skill.get("description", "")
+        text = f"{name} {desc}"
+        tokens = set(_tokenize(text))
+        for t in tokens:
+            doc_freq[t] += 1
 
-    # Direct overlap
-    intersection = query_set & skill_set
-    direct_score = len(intersection) / max(len(query_set), 1)
+    # Compute IDF: log(N / df) with smoothing
+    idf = {}
+    for token, df in doc_freq.items():
+        idf[token] = math.log((N + 1) / (df + 1)) + 1.0
 
-    # Partial overlap: query words contained in skill words
-    partial_hits = 0
-    for qt in query_set:
-        if qt not in intersection:
-            for st in skill_set:
-                if qt in st or st in qt:
-                    partial_hits += 1
-                    break
-    partial_score = partial_hits / max(len(query_set), 1)
-
-    # Normalization: prefer skills with reasonable token counts
-    norm_score = min(len(skill_tokens) / 20.0, 1.0)
-
-    return (direct_score * 0.6) + (partial_score * 0.3) + (norm_score * 0.1)
+    return idf
 
 
 def _keyword_relevance(
@@ -92,28 +87,77 @@ def _keyword_relevance(
     top_n: int = 5,
     min_score: float = 0.15,
 ) -> List[Dict[str, Any]]:
-    """Rank skills by keyword overlap with the user message."""
+    """Rank skills by TF-IDF-inspired keyword relevance.
+
+    Scoring components (all 0.0–1.0):
+    - idf_score (0.50): Weighted overlap using IDF — rare matching terms
+      count more than common ones.
+    - name_score (0.35): Direct hits in the skill NAME — heavily boosted
+      because the name is a much stronger signal than description text.
+    - coverage (0.15): What fraction of query tokens found a match?
+      Prevents single-token matches from dominating.
+    """
     query_tokens = _tokenize(user_message)
+    if not query_tokens:
+        return []
+
+    # Build IDF weights
+    idf = _build_idf(skills)
+    if not idf:
+        return []
+
+    query_tf: Counter = Counter(query_tokens)
 
     scored = []
     for skill in skills:
         name = skill.get("name", "")
         desc = skill.get("description", "")
 
-        # Build tokens from name + description
-        skill_text = f"{name} {desc}"
-        skill_tokens = _tokenize(skill_text)
+        # Split name into hyphenated/underscored parts for better matching
+        name_parts = set()
+        for part in re.split(r"[-_/]", name.lower()):
+            part = part.strip()
+            if part and part not in _STOP_WORDS:
+                name_parts.add(part)
+        # Also add the full tokenized name
+        name_tokens = set(_tokenize(name))
+        desc_tokens = set(_tokenize(desc))
+        all_skill_tokens = name_tokens | desc_tokens | name_parts
 
-        score = _keyword_score(query_tokens, skill_tokens)
+        # ── IDF-weighted overlap ────────────────────────────────────
+        idf_sum = 0.0
+        max_possible_idf = 0.0
+        for qt, qf in query_tf.items():
+            qt_weight = idf.get(qt, 1.0)
+            max_possible_idf += qf * qt_weight
+            if qt in all_skill_tokens:
+                idf_sum += qf * qt_weight
+
+        idf_score = idf_sum / max(max_possible_idf, 0.001)
+
+        # ── Name match score ────────────────────────────────────────
+        # Direct name part matches get high weight
+        name_hits = 0
+        for qt in set(query_tokens):
+            if qt in name_parts or qt in name_tokens:
+                name_hits += 1
+        name_score = min(name_hits / max(len(set(query_tokens)), 1), 1.0)
+
+        # ── Query coverage ──────────────────────────────────────────
+        unique_query = set(query_tokens)
+        matched_query = unique_query & all_skill_tokens
+        coverage = len(matched_query) / max(len(unique_query), 1)
+
+        # ── Composite score ─────────────────────────────────────────
+        score = (idf_score * 0.50) + (name_score * 0.35) + (coverage * 0.15)
 
         if score >= min_score:
             scored.append({
                 "name": name,
                 "description": desc,
-                "score": round(score, 4),
+                "score": round(min(score, 1.0), 4),
             })
 
-    # Sort by score descending
     scored.sort(key=lambda s: s["score"], reverse=True)
     return scored[:top_n]
 
@@ -122,13 +166,13 @@ def _keyword_relevance(
 
 _EMBEDDING_MODEL = None
 
+
 def _get_embedding_model():
     """Lazy-load the sentence-transformers model."""
     global _EMBEDDING_MODEL
     if _EMBEDDING_MODEL is None:
         try:
             from sentence_transformers import SentenceTransformer
-            # Use a small, fast model — all-MiniLM is 80MB, very fast on CPU
             model_name = os.getenv(
                 "LAZY_SKILLS_EMBEDDING_MODEL",
                 "all-MiniLM-L6-v2",
@@ -161,24 +205,20 @@ def _embedding_relevance(
     """Rank skills by cosine similarity of embeddings."""
     model = _get_embedding_model()
     if model is None:
-        # Fall back to keyword method
         logger.info("lazy-load-skills: embedding unavailable, using keyword fallback")
         return _keyword_relevance(user_message, skills, top_n, min_score)
 
     import numpy as np
 
-    # Embed the user message
     query_embedding = model.encode([user_message], convert_to_numpy=True)[0]
     query_norm = np.linalg.norm(query_embedding)
 
-    # Embed skill descriptions
     skill_texts = [
         f"{s.get('name', '')}: {s.get('description', '')}"
         for s in skills
     ]
     skill_embeddings = model.encode(skill_texts, convert_to_numpy=True)
 
-    # Compute cosine similarities
     scored = []
     for i, skill in enumerate(skills):
         skill_norm = np.linalg.norm(skill_embeddings[i])
@@ -231,13 +271,16 @@ def compute_relevance(
 def get_available_skills() -> List[Dict[str, Any]]:
     """Discover all available skills from the Hermes skills directory.
 
-    Parses SKILL.md files for YAML frontmatter to extract name and
-    description. Falls back to filename-based extraction if SKILL.md
-    is unavailable.
+    Walks the skills directory tree recursively. For each SKILL.md found,
+    extracts the ``name`` and ``description`` from YAML frontmatter.
+
+    Returns:
+        List of skill dicts with keys: ``name``, ``description``, ``path``.
+        Filtered to only return leaf skills (SKILL.md files), not empty
+        category directories.
     """
     skills = []
 
-    # Find the skills directory
     skills_dir = _find_skills_dir()
     if not skills_dir:
         return skills
@@ -247,43 +290,54 @@ def get_available_skills() -> List[Dict[str, Any]]:
     except ImportError:
         yaml = None
 
-    for skill_dir in sorted(skills_dir.iterdir()):
-        if not skill_dir.is_dir():
+    # Walk recursively — skills can be nested 2-3 levels deep
+    # (e.g., devops/docker-management/SKILL.md)
+    for root, dirs, files in os.walk(skills_dir):
+        # Skip dot-prefixed hidden dirs
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+
+        skill_md = Path(root) / "SKILL.md"
+        if not skill_md.exists():
             continue
 
-        skill_md = skill_dir / "SKILL.md"
-        name = skill_dir.name
+        # Build relative path from skills_dir for name resolution
+        rel_path = Path(root).relative_to(skills_dir)
+        dir_name = rel_path.name if rel_path != Path(".") else skills_dir.name
+
+        name = dir_name
         description = ""
 
-        if skill_md.exists():
-            try:
-                content = skill_md.read_text(encoding="utf-8", errors="replace")
-                # Extract YAML frontmatter between --- markers
-                fm_match = re.match(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
-                if fm_match and yaml:
-                    try:
-                        frontmatter = yaml.safe_load(fm_match.group(1))
-                        if isinstance(frontmatter, dict):
-                            name = frontmatter.get("name", name)
-                            description = frontmatter.get("description", "")
-                    except yaml.YAMLError:
-                        pass
-                elif fm_match:
-                    # Crude frontmatter parse without yaml
-                    fm = fm_match.group(1)
-                    for line in fm.split("\n"):
-                        line = line.strip()
-                        if line.startswith("name:"):
-                            name = line.split(":", 1)[1].strip().strip('"').strip("'")
-                        elif line.startswith("description:"):
-                            description = line.split(":", 1)[1].strip().strip('"').strip("'")
-            except Exception:
-                pass
+        try:
+            content = skill_md.read_text(encoding="utf-8", errors="replace")
+            fm_match = re.match(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
+            if fm_match and yaml:
+                try:
+                    frontmatter = yaml.safe_load(fm_match.group(1))
+                    if isinstance(frontmatter, dict):
+                        name = frontmatter.get("name", name)
+                        description = frontmatter.get("description", "")
+                except yaml.YAMLError:
+                    pass
+            elif fm_match:
+                # Crude frontmatter parse without yaml
+                for line in fm_match.group(1).split("\n"):
+                    line = line.strip()
+                    if line.startswith("name:"):
+                        name = line.split(":", 1)[1].strip().strip('"').strip("'")
+                    elif line.startswith("description:"):
+                        description = line.split(":", 1)[1].strip().strip('"').strip("'")
+        except Exception:
+            pass
+
+        # Skip umbrella SKILL.md files that are just category headers
+        # (they typically have no tools or hooks in frontmatter)
+        if not description and name == dir_name:
+            continue
 
         skills.append({
             "name": name,
             "description": description,
-            "path": str(skill_dir),
+            "path": str(Path(root)),
         })
 
     return skills
@@ -291,20 +345,17 @@ def get_available_skills() -> List[Dict[str, Any]]:
 
 def _find_skills_dir() -> Optional[Path]:
     """Locate the Hermes skills directory."""
-    # Check env override first
     env_dir = os.getenv("HERMES_SKILLS_DIR")
     if env_dir:
         p = Path(env_dir)
         if p.is_dir():
             return p
 
-    # Default locations
     candidates = [
         Path.home() / ".hermes" / "skills",
         Path("/usr/local/lib/hermes-agent/skills"),
     ]
 
-    # Also check HERMES_HOME
     hermes_home = os.getenv("HERMES_HOME")
     if hermes_home:
         candidates.insert(0, Path(hermes_home) / "skills")

@@ -74,18 +74,13 @@ def _hash_message(text: str) -> int:
 
 
 def _build_skills_context(
-    skills: List[Dict[str, Any]],
     user_message: str,
-    is_first_turn: bool,
 ) -> str:
     """Build the context block that replaces the system prompt skills list.
 
     Returns a string to inject into the user message context, or empty
     string if no skills are relevant enough.
     """
-    if not skills:
-        return ""
-
     # Get all available skills for relevance scoring
     all_skills = get_available_skills()
     if not all_skills:
@@ -182,9 +177,7 @@ def on_pre_llm_call(
 
     # Compute and cache
     context = _build_skills_context(
-        skills=get_available_skills(),
         user_message=user_message,
-        is_first_turn=is_first_turn,
     )
 
     if not context:
