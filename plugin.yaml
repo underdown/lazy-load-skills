@@ -1,0 +1,7 @@
+name: lazy-load-skills
+version: 1.0.0
+description: "Lazy-loads only the skills relevant to the current user message, reducing system prompt token usage by 2-5K tokens. Pre-loads full SKILL.md content for matched skills so the agent never needs to call skill_view."
+author: Ryan (based on Hermes pipeline research)
+kind: standalone
+provides_hooks:
+  - pre_llm_call
